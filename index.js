@@ -89,6 +89,66 @@ async function run() {
       }
     });
 
+    app.get("/api/admin/overview", verifyToken, async (req, res) => {
+      try {
+        const [users, tasks, payments] = await Promise.all([
+          usersCollection.find({}, { projection: { password: 0 } }).toArray(),
+          tasksCollection.find({}).sort({ createdAt: -1 }).toArray(),
+          paymentCollection
+            .aggregate([
+              {
+                $lookup: {
+                  from: "tasks",
+                  localField: "taskId",
+                  foreignField: "_id",
+                  as: "task",
+                },
+              },
+              { $unwind: { path: "$task", preserveNullAndEmptyArrays: true } },
+            ])
+            .toArray(),
+        ]);
+
+        const proposalStats = {
+          total: 0,
+          pending: 0,
+          accepted: 0,
+          rejected: 0,
+        };
+        tasks.forEach((task) => {
+          (task.proposals || []).forEach((proposal) => {
+            proposalStats.total += 1;
+            const status = String(proposal.status || "pending").toLowerCase();
+            if (status === "accepted") proposalStats.accepted += 1;
+            else if (status === "rejected") proposalStats.rejected += 1;
+            else proposalStats.pending += 1;
+          });
+        });
+
+        const paymentStats = {
+          total: payments.length,
+          volume: payments.reduce(
+            (sum, payment) => sum + (Number(payment.task?.budget) || 0),
+            0,
+          ),
+        };
+
+        res.status(200).json({
+          success: true,
+          users,
+          tasks,
+          payments: paymentStats,
+          proposals: proposalStats,
+          recentActivity: tasks.slice(0, 10),
+        });
+      } catch (error) {
+        console.error("Error loading admin overview:", error);
+        res
+          .status(500)
+          .json({ success: false, message: "Internal server error" });
+      }
+    });
+
     app.patch("/api/admin/users/:id/status", verifyToken, async (req, res) => {
       try {
         const { id } = req.params;
