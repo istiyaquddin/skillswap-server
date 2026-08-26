@@ -1276,7 +1276,7 @@ async function run() {
       }
     });
 
-    app.patch("/api/tasks/complete/:id", async (req, res) => {
+    app.patch("/api/tasks/complete/:id", verifyToken, async (req, res) => {
       try {
         const { id } = req.params;
         const { deliverableUrl } = req.body;
