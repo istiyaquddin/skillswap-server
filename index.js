@@ -1,11 +1,26 @@
-// Repository maintenance note
 const express = require("express");
 const cors = require("cors");
+const dns = require("dns");
+
+try {
+  dns.setDefaultResultOrder("ipv4first");
+  dns.setServers(["8.8.8.8", "1.1.1.1"]);
+} catch (e) {
+  // ignore in environments where dns setServers is restricted
+}
+
 const app = express();
 const port = process.env.PORT || 5000;
 require("dotenv").config();
 app.use(cors());
 app.use(express.json());
+
+const normalizeTaskStatus = (status) =>
+  String(status ?? "open")
+    .trim()
+    .toLowerCase();
+
+const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const { createRemoteJWKSet, jwtVerify } = require("jose-cjs");
@@ -47,7 +62,7 @@ const verifyToken = async (req, res, next) => {
 };
 
 const JWKS = createRemoteJWKSet(
-  new URL(`${process.env.CLIENT_URL}/api/auth/jwks`),
+  new URL(`${process.env.CLIENT_URL.replace(/\/$/, "")}/api/auth/jwks`),
 );
 
 async function run() {
@@ -288,12 +303,10 @@ async function run() {
             .json({ success: false, msg: "Task not found!" });
         }
 
-        res
-          .status(200)
-          .json({
-            success: true,
-            msg: "Status updated globally across the website!",
-          });
+        res.status(200).json({
+          success: true,
+          msg: "Status updated globally across the website!",
+        });
       } catch (error) {
         console.error("Global Payment API Error:", error);
         res
@@ -763,7 +776,7 @@ async function run() {
       }
     });
 
-    app.delete("/api/tasks/:id", async (req, res) => {
+    app.delete("/api/tasks/:id", verifyToken, async (req, res) => {
       try {
         const { id } = req.params;
 
@@ -782,7 +795,7 @@ async function run() {
             message: "Task not found",
           });
         }
-        if (existingTask.status !== "open") {
+        if (normalizeTaskStatus(existingTask.status) !== "open") {
           return res.status(403).send({
             success: false,
             message: "Only open tasks can be deleted",
@@ -805,7 +818,7 @@ async function run() {
       }
     });
 
-    app.put("/api/tasks/:id", async (req, res) => {
+    app.put("/api/tasks/:id", verifyToken, async (req, res) => {
       try {
         const { id } = req.params;
         const updatedTask = req.body;
@@ -824,7 +837,7 @@ async function run() {
             message: "Task not found",
           });
         }
-        if (existingTask.status !== "open") {
+        if (normalizeTaskStatus(existingTask.status) !== "open") {
           return res.status(403).send({
             success: false,
             message: "Only open tasks can be edited",
@@ -882,7 +895,11 @@ async function run() {
         const skip = (currentPage - 1) * currentLimit;
         const query = {};
         if (status) {
-          query.status = status;
+          const normalizedStatus = normalizeTaskStatus(status);
+          query.status = {
+            $regex: `^${escapeRegExp(normalizedStatus)}$`,
+            $options: "i",
+          };
         }
         if (search) {
           query.$or = [
@@ -969,6 +986,7 @@ async function run() {
         }
         const finalTaskData = {
           ...task,
+          status: normalizeTaskStatus(task.status || "open"),
           proposals: task.proposals || [],
         };
         const result = await tasksCollection.insertOne(finalTaskData);
@@ -987,9 +1005,12 @@ async function run() {
 
     app.get("/api/my-proposals", verifyToken, async (req, res) => {
       try {
-        const { email } = req.query;
+        let email = req.query.email || req.query.freelancerEmail;
+        if (email === "mine") {
+          email = req.query.email;
+        }
 
-        if (!email) {
+        if (!email || email === "mine") {
           return res
             .status(400)
             .send({ error: true, message: "Freelancer email is required" });
@@ -1049,13 +1070,11 @@ async function run() {
           $push: { proposals: newProposal },
         };
         const result = await tasksCollection.updateOne(filter, updateDoc);
-        res
-          .status(201)
-          .send({
-            success: true,
-            message: "Proposal submitted successfully",
-            data: newProposal,
-          });
+        res.status(201).send({
+          success: true,
+          message: "Proposal submitted successfully",
+          data: newProposal,
+        });
       } catch (error) {
         res.status(500).send({ error: true, message: "Internal server error" });
       }
@@ -1069,12 +1088,10 @@ async function run() {
           const { taskId, proposalId } = req.params;
           const { status } = req.body;
           if (!ObjectId.isValid(taskId) || !ObjectId.isValid(proposalId)) {
-            return res
-              .status(400)
-              .send({
-                error: true,
-                message: "Invalid Task ID or Proposal ID format",
-              });
+            return res.status(400).send({
+              error: true,
+              message: "Invalid Task ID or Proposal ID format",
+            });
           }
           if (!status) {
             return res
@@ -1095,12 +1112,10 @@ async function run() {
               .status(404)
               .send({ error: true, message: "Task or Proposal not found" });
           }
-          res
-            .status(200)
-            .send({
-              success: true,
-              message: `Proposal status updated to ${status}`,
-            });
+          res.status(200).send({
+            success: true,
+            message: `Proposal status updated to ${status}`,
+          });
         } catch (error) {
           console.error("Error updating proposal status:", error);
           res
@@ -1174,20 +1189,18 @@ async function run() {
             .send({ success: false, message: "Freelancer email is required" });
         }
 
-        // টাস্ক কালেকশন থেকে ডাটা ফিল্টার করা
         const projects = await tasksCollection
           .find({
             "proposals.freelancerEmail": email,
-            status: { $in: ["Accepted", "Completed"] }, // শুধু Accepted এবং Completed গুলো নিব
+            status: { $in: [/^accepted$/i, /^completed$/i] },
           })
           .toArray();
 
-        // ফ্রন্টএন্ডের সুবিধার জন্য Accepted এবং Completed আলাদা করে পাঠানো
         const activeProjects = projects.filter(
-          (task) => task.status === "Accepted",
+          (task) => normalizeTaskStatus(task.status) === "accepted",
         );
         const completedProjects = projects.filter(
-          (task) => task.status === "Completed",
+          (task) => normalizeTaskStatus(task.status) === "completed",
         );
 
         res.status(200).send({
@@ -1236,12 +1249,10 @@ async function run() {
             .send({ success: false, message: "Task not found" });
         }
 
-        res
-          .status(200)
-          .send({
-            success: true,
-            message: "Task marked as completed successfully!",
-          });
+        res.status(200).send({
+          success: true,
+          message: "Task marked as completed successfully!",
+        });
       } catch (error) {
         console.error("Error completing task:", error);
         res
