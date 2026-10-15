@@ -240,11 +240,14 @@ async function run() {
             title: task.title,
             category: cleanCategory,
             budget: task.budget,
-            status: task.status ? String(task.status).trim() : "Open",
-            proposals: task.proposals, // প্রপোজাল অ্যারে সরাসরি পাস করা হলো
+            status: task.status ? String(task.status).trim() : "open",
+            approvalStatus: task.approvalStatus || (String(task.status).toLowerCase() === "pending" ? "pending" : "approved"),
+            escrowStatus: task.escrowStatus || "unfunded",
+            proposals: task.proposals || [], // প্রপোজাল অ্যারে সরাসরি পাস করা হলো
             createdAt: task.createdAt,
-            // আপনার ডেটাবেজের client_email কে ফ্রন্টএন্ডের clientEmail এ ম্যাপ করা হলো
             clientEmail: task.client_email || "no-email@domain.com",
+            description: task.description || "",
+            deadline: task.deadline || "",
           };
         });
 
@@ -254,6 +257,266 @@ async function run() {
         res
           .status(500)
           .json({ success: false, message: "Internal server error" });
+      }
+    });
+
+    // Admin Task Approval / Rejection Endpoint
+    app.patch("/api/admin/tasks/:id/approval", verifyToken, async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { action, reason } = req.body; // action: "approve" | "reject"
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ success: false, message: "Invalid Task ID format" });
+        }
+
+        const task = await tasksCollection.findOne({ _id: new ObjectId(id) });
+        if (!task) {
+          return res.status(404).json({ success: false, message: "Task not found" });
+        }
+
+        let updateDoc = {};
+        if (action === "approve") {
+          updateDoc = {
+            $set: {
+              status: "open",
+              approvalStatus: "approved",
+              adminApprovedAt: new Date(),
+              rejectionReason: null,
+            },
+          };
+        } else if (action === "reject") {
+          updateDoc = {
+            $set: {
+              status: "rejected",
+              approvalStatus: "rejected",
+              rejectionReason: reason || "Declined by Admin",
+              adminRejectedAt: new Date(),
+            },
+          };
+        } else {
+          return res.status(400).json({ success: false, message: "Invalid action. Use 'approve' or 'reject'." });
+        }
+
+        await tasksCollection.updateOne({ _id: new ObjectId(id) }, updateDoc);
+        res.status(200).json({
+          success: true,
+          message: `Task ${action === "approve" ? "approved and made live" : "rejected"} successfully`,
+        });
+      } catch (error) {
+        console.error("Error approving/rejecting task:", error);
+        res.status(500).json({ success: false, message: "Internal server error" });
+      }
+    });
+
+    // Admin Direct Task Status Override
+    app.patch("/api/admin/tasks/:id/status", verifyToken, async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { status } = req.body;
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ success: false, message: "Invalid Task ID" });
+        }
+
+        if (!status) {
+          return res.status(400).json({ success: false, message: "Status is required" });
+        }
+
+        const normalized = normalizeTaskStatus(status);
+        await tasksCollection.updateOne(
+          { _id: new ObjectId(id) },
+          {
+            $set: {
+              status: normalized,
+              approvalStatus: normalized === "rejected" ? "rejected" : "approved",
+              updatedAt: new Date(),
+            },
+          }
+        );
+
+        res.status(200).json({ success: true, message: `Task status updated to ${status}` });
+      } catch (error) {
+        console.error("Error updating task status:", error);
+        res.status(500).json({ success: false, message: "Internal server error" });
+      }
+    });
+
+    // Admin Proposal Moderation & Job Assignment Override ("get the job or not")
+    app.patch("/api/admin/tasks/:taskId/proposals/:proposalId/moderate", verifyToken, async (req, res) => {
+      try {
+        const { taskId, proposalId } = req.params;
+        const { action } = req.body; // "award" | "reject" | "revoke"
+
+        if (!ObjectId.isValid(taskId) || !ObjectId.isValid(proposalId)) {
+          return res.status(400).json({ success: false, message: "Invalid Task or Proposal ID" });
+        }
+
+        const task = await tasksCollection.findOne({ _id: new ObjectId(taskId) });
+        if (!task) {
+          return res.status(404).json({ success: false, message: "Task not found" });
+        }
+
+        const pId = new ObjectId(proposalId);
+        const filter = { _id: new ObjectId(taskId) };
+
+        if (action === "award") {
+          const updateDoc = {
+            $set: {
+              status: "Accepted",
+              "proposals.$[target].status": "Accepted",
+              "proposals.$[other].status": "Rejected",
+              assignedAt: new Date(),
+              assignedBy: "admin",
+            },
+          };
+          const options = {
+            arrayFilters: [
+              { "target.proposalId": pId },
+              { "other.proposalId": { $ne: pId }, "other.status": { $ne: "Accepted" } },
+            ],
+          };
+          await tasksCollection.updateOne(filter, updateDoc, options);
+          return res.status(200).json({ success: true, message: "Job awarded to candidate by Admin" });
+        } else if (action === "reject") {
+          const updateDoc = {
+            $set: { "proposals.$[target].status": "Rejected" },
+          };
+          const options = {
+            arrayFilters: [{ "target.proposalId": pId }],
+          };
+          await tasksCollection.updateOne(filter, updateDoc, options);
+          return res.status(200).json({ success: true, message: "Proposal rejected by Admin" });
+        } else if (action === "revoke") {
+          const updateDoc = {
+            $set: {
+              status: "open",
+              "proposals.$[target].status": "Pending",
+            },
+          };
+          const options = {
+            arrayFilters: [{ "target.proposalId": pId }],
+          };
+          await tasksCollection.updateOne(filter, updateDoc, options);
+          return res.status(200).json({ success: true, message: "Job award revoked. Task reopened." });
+        } else {
+          return res.status(400).json({ success: false, message: "Invalid action. Use 'award', 'reject', or 'revoke'." });
+        }
+      } catch (error) {
+        console.error("Error moderating proposal:", error);
+        res.status(500).json({ success: false, message: "Internal server error" });
+      }
+    });
+
+    // Admin Escrow & Global Payments Ledger Endpoint ("any money given or taken")
+    app.get("/api/admin/payments", verifyToken, async (req, res) => {
+      try {
+        const payments = await paymentCollection.find({}).sort({ createdAt: -1 }).toArray();
+        const allTasks = await tasksCollection.find({}).toArray();
+        const taskMap = new Map();
+        allTasks.forEach((t) => taskMap.set(String(t._id), t));
+
+        const formattedPayments = payments.map((p) => {
+          const task = taskMap.get(String(p.taskId)) || null;
+          let freelancerEmail = "N/A";
+          if (task && Array.isArray(task.proposals)) {
+            const acceptedProp = task.proposals.find(
+              (prop) =>
+                String(prop.status).toLowerCase() === "accepted" ||
+                (p.proposalId && String(prop.proposalId) === String(p.proposalId))
+            );
+            if (acceptedProp) {
+              freelancerEmail = acceptedProp.freelancerEmail || acceptedProp.email || "N/A";
+            }
+          }
+
+          const escrowStatus = p.escrowStatus || (
+            task?.status?.toLowerCase() === "completed" ? "Released" :
+            task?.status?.toLowerCase() === "cancelled" ? "Refunded" :
+            "Held"
+          );
+
+          return {
+            _id: p._id,
+            sessionId: p.sessionId,
+            taskId: p.taskId,
+            taskTitle: task?.title || "Untitled Task",
+            taskCategory: task?.category || "General",
+            clientEmail: p.userEmail || task?.client_email || "N/A",
+            freelancerEmail,
+            amount: Number(task?.budget) || 0,
+            escrowStatus,
+            createdAt: p.createdAt || task?.createdAt,
+            taskStatus: task?.status || "In Progress",
+          };
+        });
+
+        res.status(200).json({ success: true, payments: formattedPayments });
+      } catch (error) {
+        console.error("Error fetching admin payments:", error);
+        res.status(500).json({ success: false, message: "Internal server error" });
+      }
+    });
+
+    // Admin Escrow Actions (Release Funds to Freelancer, Refund to Client, Freeze Dispute)
+    app.patch("/api/admin/payments/:id/escrow", verifyToken, async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { action, note } = req.body; // action: "release" | "refund" | "freeze" | "unfreeze"
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ success: false, message: "Invalid Payment ID" });
+        }
+
+        const payment = await paymentCollection.findOne({ _id: new ObjectId(id) });
+        if (!payment) {
+          return res.status(404).json({ success: false, message: "Payment record not found" });
+        }
+
+        let newStatus = "Held";
+        let taskStatusUpdate = {};
+
+        if (action === "release") {
+          newStatus = "Released";
+          taskStatusUpdate = { status: "Completed", escrowStatus: "Released" };
+        } else if (action === "refund") {
+          newStatus = "Refunded";
+          taskStatusUpdate = { status: "Cancelled", escrowStatus: "Refunded" };
+        } else if (action === "freeze") {
+          newStatus = "Frozen";
+          taskStatusUpdate = { escrowStatus: "Frozen" };
+        } else if (action === "unfreeze") {
+          newStatus = "Held";
+          taskStatusUpdate = { escrowStatus: "Held" };
+        } else {
+          return res.status(400).json({ success: false, message: "Invalid action" });
+        }
+
+        await paymentCollection.updateOne(
+          { _id: new ObjectId(id) },
+          {
+            $set: {
+              escrowStatus: newStatus,
+              adminNote: note || "",
+              updatedAt: new Date(),
+            },
+          }
+        );
+
+        if (payment.taskId && ObjectId.isValid(payment.taskId)) {
+          await tasksCollection.updateOne(
+            { _id: new ObjectId(payment.taskId) },
+            { $set: taskStatusUpdate }
+          );
+        }
+
+        res.status(200).json({
+          success: true,
+          message: `Escrow funds successfully updated to '${newStatus}' by Admin.`,
+        });
+      } catch (error) {
+        console.error("Error processing escrow action:", error);
+        res.status(500).json({ success: false, message: "Internal server error" });
       }
     });
 
@@ -321,6 +584,7 @@ async function run() {
             proposalId && ObjectId.isValid(proposalId)
               ? new ObjectId(proposalId)
               : proposalId,
+          escrowStatus: "Held",
           createdAt: new Date(),
         });
 
@@ -332,6 +596,7 @@ async function run() {
           updateDoc = {
             $set: {
               status: "Accepted",
+              escrowStatus: "Held",
               // নির্দিষ্ট প্রপোজালটি Accepted হবে
               "proposals.$[elem].status": "Accepted",
               // বাকি সব 'Pending' প্রপোজাল অটোমেটিক 'Rejected' হয়ে যাবে
@@ -348,7 +613,7 @@ async function run() {
             ],
           };
         } else {
-          updateDoc = { $set: { status: "Accepted" } };
+          updateDoc = { $set: { status: "Accepted", escrowStatus: "Held" } };
         }
 
         const result = await tasksCollection.updateOne(
@@ -1044,10 +1309,15 @@ async function run() {
             message: "Task already exists",
           });
         }
+        const initialStatus = task.status ? normalizeTaskStatus(task.status) : "pending";
         const finalTaskData = {
           ...task,
-          status: normalizeTaskStatus(task.status || "open"),
+          status: initialStatus,
+          approvalStatus: initialStatus === "open" ? "approved" : "pending",
+          escrowStatus: task.escrowStatus || "unfunded",
+          adminApprovedAt: initialStatus === "open" ? new Date() : null,
           proposals: task.proposals || [],
+          createdAt: task.createdAt ? new Date(task.createdAt) : new Date(),
         };
         const result = await tasksCollection.insertOne(finalTaskData);
         res.status(201).send({
